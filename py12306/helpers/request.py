@@ -72,4 +72,16 @@ class Request(HTMLSession):
         if not cdn: cdn = Cdn.get_cdn()
         url = url.replace(HOST_URL_OF_12306, cdn)
 
-        return self.request(method, url, headers={'Host': HOST_URL_OF_12306}, verify=False, **kwargs)
+        req_start_time = time_now()
+
+        resp = self.request(method,url, headers={'Host': HOST_URL_OF_12306}, verify=False, **kwargs)
+
+        req_end_time = time_now()
+        time_span_ms = int((req_end_time-req_start_time).microseconds / 1000)
+
+        if resp.status_code == 200:
+            Cdn.report_cdn_result(cdn, time_span_ms)
+        else:
+            Cdn.report_cdn_result(cdn, 0, success = False)
+
+        return resp

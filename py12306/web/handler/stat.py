@@ -29,7 +29,7 @@ def dashboard():
     }
     if Config().CDN_ENABLED:
         from py12306.helpers.cdn import Cdn
-        res['cdn_count'] = len(Cdn().available_items)
+        res['cdn_count'] = 0
     return jsonify(res)
 
 

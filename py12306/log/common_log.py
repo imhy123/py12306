@@ -54,6 +54,7 @@ class CommonLog(BaseLog):
     MESSAGE_CDN_RESTORE_SUCCESS = 'CDN 恢复成功，上次检测 {}\n'
     MESSAGE_CDN_CHECKED_SUCCESS = '# CDN 检测完成，可用 CDN {} #\n'
     MESSAGE_CDN_CLOSED = '# CDN 已关闭 #'
+    MESSAGE_CDN_VERSION_OUTDATED = '# CDN 恢复文件版本过低，不再恢复 #'
 
     def __init__(self):
         super().__init__()

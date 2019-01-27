@@ -11,6 +11,57 @@ from py12306.helpers.func import *
 from py12306.helpers.request import Request
 from py12306.log.common_log import CommonLog
 
+class CdnItem:
+    """
+    对单个CDN服务器的抽象
+    单个CDN服务器的权重： 成功率 * 成功率权重 + (1000ms - 最近10次平均延迟) / 1000ms * 延迟权重
+    """
+    SUCCESS_RATE_WEIGHT = 10000  # 成功率权重
+    BASE_DELAY_MS = 1000  # 基准延迟
+    AVG_DELAY_WEIGHT = 1000  # 延迟权重
+
+    MAX_DELAY_DATA = 10 # 记录最近10次的延迟
+
+    def __init__(self, host):
+        self.host = host
+        self.list_index = None
+
+        self.request_count = 0
+        self.success_count = 0
+        self.delay_data = []  # 最近10次的延迟记录
+        self.delay_count = 0
+        self.delay_rate_score = 0 # 记录延迟得分，失败时不需要重复计算
+
+        self.weight = 0
+
+    def add_request_result(self, delay, success = True):
+        self.request_count += 1
+
+        if success:
+            self.success_count += 1
+
+            if len(self.delay_data) >= self.MAX_DELAY_DATA:
+                x = self.delay_data.pop(0)
+                self.delay_count -= x
+
+            self.delay_count += delay
+            self.delay_data.append(delay)
+
+            avg_delay = self.delay_count / len(self.delay_data)
+
+            self.delay_rate_score = (self.BASE_DELAY_MS - avg_delay) / self.BASE_DELAY_MS
+            self.delay_rate_score = self.delay_rate_score if self.delay_rate_score > 0 else 0
+
+        success_rate = self.success_count / self.request_count
+
+        self.weight = success_rate  * self.SUCCESS_RATE_WEIGHT + self.delay_rate_score * self.AVG_DELAY_WEIGHT
+
+
+class CdnItemEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, CdnItem):
+            return {'host': obj.host, 'request_count': obj.request_count, 'success_count': obj.success_count, 'weight': obj.weight}
+        return json.JSONEncoder.default(self, obj)
 
 @singleton
 class Cdn:
@@ -18,41 +69,37 @@ class Cdn:
     CDN 管理
     """
     items = []
-    available_items = []
-    unavailable_items = []
-    recheck_available_items = []
-    recheck_unavailable_items = []
-    retry_time = 3
     is_ready = False
-    is_finished = False
-    is_ready_num = 10  # 当可用超过 10，已准备好
     is_alive = True
-    is_recheck = False
 
     safe_stay_time = 0.2
     retry_num = 1
     thread_num = 5
     check_time_out = 3
 
-    last_check_at = 0
-    save_second = 5
-    check_keep_second = 60 * 60 * 24
+    lock = threading.Lock()
+    cdn_list = []
+    cdn_map = {}
 
     def __init__(self):
         self.cluster = Cluster()
         self.init_config()
-        create_thread_and_run(self, 'watch_cdn', False)
-
-    def init_data(self):
-        self.items = []
-        self.available_items = []
-        self.unavailable_items = []
-        self.is_finished = False
-        self.is_ready = False
-        self.is_recheck = False
 
     def init_config(self):
         self.check_time_out = Config().CDN_CHECK_TIME_OUT
+
+    def init_data(self):
+        self.items = []
+        self.is_ready = False
+
+    def destroy(self):
+        """
+        关闭 CDN
+        :return:
+        """
+        CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_CLOSED).flush()
+        self.is_alive = False
+        self.init_data()
 
     def update_cdn_status(self, auto=False):
         if auto:
@@ -75,13 +122,26 @@ class Cdn:
         self.load_items()
         CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_START_TO_CHECK.format(len(self.items))).flush()
         self.restore_items()
-        for i in range(self.thread_num):  # 多线程
-            create_thread_and_run(jobs=self, callback_name='check_available', wait=False)
+
+        self.is_ready = True
+
+        create_thread_and_run(self, 'watch_cdn', False)
+        # for i in range(self.thread_num):  # 多线程
+        #     print("[%s] start create thread" % threading.current_thread().name)
+        #     create_thread_and_run(jobs=self, callback_name='check_available', wait=False)
 
     def load_items(self):
         with open(Config().CDN_ITEM_FILE, encoding='utf-8') as f:
             for line, val in enumerate(f):
-                self.items.append(val.rstrip('\n'))
+                host = val.rstrip('\n')
+
+                cdn_item = CdnItem(host)
+                cdn_item.list_index = len(self.cdn_list)
+
+                self.cdn_map[host] = cdn_item
+                self.cdn_list.append(cdn_item)
+
+                self.items.append(host)
 
     def restore_items(self):
         """
@@ -97,48 +157,45 @@ class Cdn:
                 except json.JSONDecodeError as e:
                     result = {}
 
-        # if Config.is_cluster_enabled(): # 集群不用同步 cdn
-        #     result = self.get_data_from_cluster()
-
         if result:
+            version = result.get('version', 1)
+            if version <= 1:
+                CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_VERSION_OUTDATED).flush()
+                return False
+
             self.last_check_at = result.get('last_check_at', '')
-            if self.last_check_at: self.last_check_at = str_to_time(self.last_check_at)
-            self.available_items = result.get('items', [])
-            self.unavailable_items = result.get('fail_items', [])
-            CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_RESTORE_SUCCESS.format(self.last_check_at)).flush()
+            if self.last_check_at:
+                self.last_check_at = str_to_time(self.last_check_at)
+
+            restore_cdn_list = result.get('cdn_list', [])
+            for x in restore_cdn_list:
+                cdn_item = self.cdn_map[x.get('host')]
+                cdn_item.request_count = x.get('request_count')
+                cdn_item.success_count = x.get('success_count')
+                cdn_item.weight = x.get('weight')
+
+            self.resort_cdn_list()
+
+            CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_RESTORE_SUCCESS.format(self.last_check_at )).flush()
             return True
+
         return False
 
-    # def get_data_from_cluster(self):
-    #     available_items = self.cluster.session.smembers(Cluster.KEY_CDN_AVAILABLE_ITEMS)
-    #     last_time = self.cluster.session.get(Cluster.KEY_CDN_LAST_CHECK_AT, '')
-    #     if available_items and last_time:
-    #         return {'items': available_items, 'last_check_at': last_time}
-    #     return False
-
-    def is_need_to_recheck(self):
+    def resort_cdn_list(self):
         """
-        是否需要重新检查 cdn
-        :return:
+        对cdn_list进行全部重排序，仅用于从文件中恢复时的情况
         """
-        if self.last_check_at and (
-                time_now() - self.last_check_at).seconds > self.check_keep_second:
-            return True
-        return False
+        self.cdn_list.sort(key=lambda x: x.weight, reverse=True)
+        for i in range(len(self.cdn_list)):
+            self.cdn_list[i].list_index = i
 
-    def get_unchecked_item(self):
-        if not self.is_recheck:
-            items = list(set(self.items) - set(self.available_items) - set(self.unavailable_items))
-        else:
-            items = list(set(self.items) - set(self.recheck_available_items) - set(self.recheck_unavailable_items))
-        if items: return random.choice(items)
-        return None
+    def save_available_items(self):       
+        self.last_check_at = time_now()
+        data = {'version': 2,  'last_check_at': str(self.last_check_at),
+                'cdn_list': self.cdn_list}
 
-    def check_available(self):
-        while True and self.is_alive:
-            item = self.get_unchecked_item()
-            if not item: return self.check_did_finished()
-            self.check_item_available(item)
+        with open(Config().CDN_ENABLED_AVAILABLE_ITEM_FILE, 'w') as f:
+            f.write(json.dumps(data, cls=CdnItemEncoder))
 
     def watch_cdn(self):
         """
@@ -146,89 +203,56 @@ class Cdn:
         :return:
         """
         while True:
-            if self.is_alive and not self.is_recheck and self.is_need_to_recheck():  # 重新检测
-                self.is_recheck = True
-                self.is_finished = False
-                CommonLog.add_quick_log(
-                    CommonLog.MESSAGE_CDN_START_TO_RECHECK.format(len(self.items), time_now())).flush()
-                for i in range(self.thread_num):  # 多线程
-                    create_thread_and_run(jobs=self, callback_name='check_available', wait=False)
-            stay_second(self.retry_num)
+            stay_second(600)
 
-    def destroy(self):
-        """
-        关闭 CDN
-        :return:
-        """
-        CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_CLOSED).flush()
-        self.is_alive = False
-        self.init_data()
+            if self.is_alive:  # 重新检测
+                print("开始保存CDN信息")
 
-    def check_item_available(self, item, try_num=0):
-        session = Request()
-        response = session.get(API_CHECK_CDN_AVAILABLE.format(item), headers={'Host': HOST_URL_OF_12306},
-                               timeout=self.check_time_out,
-                               verify=False)
+                self.save_available_items()
+            
+    @classmethod
+    def report_cdn_result(cls, host, delay, success = True):
+        self = cls()
+        with self.lock:
+            cdn_item = self.cdn_map[host]
+            if not cdn_item:
+                print("%s cdn not found!" % host)
+                return
 
-        if response.status_code == 200:
-            if not self.is_recheck:
-                self.available_items.append(item)
+            old_weight = cdn_item.weight
+
+            cdn_item.add_request_result(delay, success)
+
+            new_weight = cdn_item.weight
+
+            # 冒泡排序
+            if new_weight > old_weight:
+                for i in range(cdn_item.list_index - 1, -1, -1):
+                    if new_weight > self.cdn_list[i].weight:
+                        self.cdn_list[i].list_index = i + 1
+                        self.cdn_list[i + 1] = self.cdn_list[i]
+                        self.cdn_list[i] = cdn_item
+                    else:
+                        break
             else:
-                self.recheck_available_items.append(item)
-            if not self.is_ready: self.check_is_ready()
-        elif try_num < self.retry_num:  # 重试
-            stay_second(self.safe_stay_time)
-            return self.check_item_available(item, try_num + 1)
-        else:
-            if not self.is_recheck:
-                self.unavailable_items.append(item)
-            else:
-                self.recheck_unavailable_items.append(item)
-        if not self.is_recheck and (
-                not self.last_check_at or (time_now() - self.last_check_at).seconds > self.save_second):
-            self.save_available_items()
-        stay_second(self.safe_stay_time)
-
-    def check_did_finished(self):
-        self.is_ready = True
-        if not self.is_finished:
-            self.is_finished = True
-            if self.is_recheck:
-                self.is_recheck = False
-                self.available_items = self.recheck_available_items
-                self.unavailable_items = self.recheck_unavailable_items
-                self.recheck_available_items = []
-                self.recheck_unavailable_items = []
-            CommonLog.add_quick_log(CommonLog.MESSAGE_CDN_CHECKED_SUCCESS.format(len(self.available_items))).flush()
-            self.save_available_items()
-
-    def save_available_items(self):
-        self.last_check_at = time_now()
-        data = {'items': self.available_items, 'fail_items': self.unavailable_items,
-                'last_check_at': str(self.last_check_at)}
-        with open(Config().CDN_ENABLED_AVAILABLE_ITEM_FILE, 'w') as f:
-            f.write(json.dumps(data))
-
-        # if Config.is_master():
-        #     self.cluster.session.sadd(Cluster.KEY_CDN_AVAILABLE_ITEMS, self.available_items)
-        #     self.cluster.session.set(Cluster.KEY_CDN_LAST_CHECK_AT, time_now())
-
-    def check_is_ready(self):
-        if len(self.available_items) > self.is_ready_num:
-            self.is_ready = True
-        else:
-            self.is_ready = False
+                for i in range(cdn_item.list_index + 1, len(self.cdn_list)):
+                    if new_weight <= self.cdn_list[i].weight:
+                        self.cdn_list[i].list_index = i - 1
+                        self.cdn_list[i - 1] = self.cdn_list[i]
+                        self.cdn_list[i] = cdn_item
+                    else:
+                        break    
 
     @classmethod
     def get_cdn(cls):
         self = cls()
-        if self.is_ready and self.available_items:
-            return random.choice(self.available_items)
-        return None
+        # if self.is_ready and self.available_items:
+        #     return random.choice(self.available_items)
+        # return None
+        random_cdn = random.choice(self.cdn_list[0:100])
+        return random_cdn.host
 
 
 if __name__ == '__main__':
     # Const.IS_TEST = True
     Cdn.run()
-    while not Cdn().is_finished:
-        stay_second(1)

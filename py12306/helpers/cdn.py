@@ -226,7 +226,7 @@ class Cdn:
             new_weight = cdn_item.weight
 
             # 冒泡排序
-            if cdn_item.list_index > 0 and new_weight > self.cdn_list[cdn_item.list_index - 1]:
+            if cdn_item.list_index > 0 and new_weight > self.cdn_list[cdn_item.list_index - 1].weight:
                 for i in range(cdn_item.list_index - 1, -1, -1):
                     if new_weight > self.cdn_list[i].weight:
                         self.cdn_list[i].list_index = i + 1
@@ -235,7 +235,7 @@ class Cdn:
                     else:
                         break
             else:
-                if cdn_item.list_index < len(self.cdn_list) -1 and new_weight <= self.cdn_list[cdn_item.list_index + 1]:
+                if cdn_item.list_index < len(self.cdn_list) -1 and new_weight <= self.cdn_list[cdn_item.list_index + 1].weight:
                     for i in range(cdn_item.list_index + 1, len(self.cdn_list)):
                         if new_weight <= self.cdn_list[i].weight:
                             self.cdn_list[i].list_index = i - 1
